@@ -11,8 +11,6 @@ def load(path, nrows=None):
 
 print("Loading test S1...")
 s1 = load("dataset/test/test_source1.tsv")
-print("S1 rows:", len(s1))
-
 print("Loading test S2...")
 s2 = load("dataset/test/test_source2.tsv")
 print("Loading test S3...")
@@ -20,20 +18,30 @@ s3 = load("dataset/test/test_source3.tsv")
 pool = pd.concat([s2, s3], ignore_index=True)
 del s2, s3
 
-print("Building lookup dictionary...")
+print("Building candidate lookup (capped at 50)...")
 grouped = pool.groupby("block_key")["entity_id"].agg(list)
 key_to_ids = {k: ",".join(v[:50]) for k, v in grouped.items()}
+
+print("Building exact-name-match lookup for matches...")
+name_to_ids = pool.groupby(["block_key", "norm_name"])["entity_id"].agg(list).to_dict()
 del pool
 
-print("Mapping candidates onto S1 (vectorized, fast)...")
 s1["candidate_entity_ids"] = s1["block_key"].map(key_to_ids).fillna("")
+
+def exact_matches(row):
+    ids = name_to_ids.get((row["block_key"], row["norm_name"]), [])
+    candidate_set = set(row["candidate_entity_ids"].split(",")) if row["candidate_entity_ids"] else set()
+    valid_ids = [i for i in ids if i in candidate_set]
+    return ",".join(valid_ids[:20])
+
+s1["matched_entity_ids"] = s1.apply(exact_matches, axis=1)
 
 print("Writing candidate_pairs.tsv...")
 cand_out = s1[["entity_id", "candidate_entity_ids"]].rename(columns={"entity_id": "source1_entity_id"})
 cand_out.to_csv("output/candidate_pairs.tsv", sep="\t", index=False)
 
-print("Writing matching_results.tsv (using same candidates as matches for this baseline)...")
-match_out = cand_out.rename(columns={"candidate_entity_ids": "matched_entity_ids"})
+print("Writing matching_results.tsv...")
+match_out = s1[["entity_id", "matched_entity_ids"]].rename(columns={"entity_id": "source1_entity_id"})
 match_out.to_csv("output/matching_results.tsv", sep="\t", index=False)
 
 print("DONE")
