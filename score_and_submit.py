@@ -92,8 +92,11 @@ def score_batch(source1_ids, candidate_ids, lookup, model, threshold, pred_map):
 
     feat_dict = compute_features_batch(names1, names2, addrs1, addrs2, countries1, countries2)
 
-    X = pd.DataFrame({col: feat_dict[col] for col in FEATURE_COLS})
-    probabilities = model.predict_proba(X.values)[:, 1]
+    X = np.column_stack([feat_dict[col] for col in FEATURE_COLS])
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        probabilities = model.predict_proba(X)[:, 1]
     matched_indices = np.flatnonzero(probabilities >= threshold)
 
     for idx in matched_indices:
@@ -202,7 +205,7 @@ def main():
     parser.add_argument("--out",             default="output/matching_results.tsv")
     parser.add_argument("--threshold",       type=float, default=0.5)
     parser.add_argument("--val-features",    default="output/val_features.tsv")
-    parser.add_argument("--chunk-size",      type=int,   default=5000)
+    parser.add_argument("--chunk-size",      type=int,   default=100_000)
     args = parser.parse_args()
 
     print("[score_and_submit.py] loading model...")
