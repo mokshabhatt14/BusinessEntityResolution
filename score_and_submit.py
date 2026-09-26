@@ -14,13 +14,51 @@ import sys
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.metrics import fbeta_score
 
 from features import FEATURE_COLS, compute_features_batch
 
 
-# ---------------------------------------------------------------------
-# Load test entity lookup
-# ---------------------------------------------------------------------
+# ─── F0.5 METRIC ─────────────────────────────────────────────────────────────
+
+def f05_per_entity(pred_ids: set, true_ids: set) -> float:
+    """
+    Compute F0.5 for one S1 entity.
+
+    True singleton (true_ids empty) correctly predicted empty → 1.0.
+    True singleton predicted non-empty → 0.0.
+    Otherwise standard F0.5 on the overlap.
+    """
+    if not true_ids:
+        return 1.0 if not pred_ids else 0.0
+
+    if not pred_ids:
+        return 0.0
+
+    tp = len(pred_ids & true_ids)
+    fp = len(pred_ids - true_ids)
+    fn = len(true_ids - pred_ids)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+    if precision + recall == 0:
+        return 0.0
+
+    return 1.25 * precision * recall / (0.25 * precision + recall)
+
+
+def macro_f05(pred_map: dict, true_map: dict, all_s1_ids: list) -> float:
+    """Macro-averaged F0.5 over all S1 entities in all_s1_ids."""
+    scores = []
+    for s1_id in all_s1_ids:
+        pred = pred_map.get(s1_id, set())
+        true = true_map.get(s1_id, set())
+        scores.append(f05_per_entity(pred, true))
+    return float(np.mean(scores)) if scores else 0.0
+
+
+# ─── LOAD ENTITY LOOKUP ──────────────────────────────────────────────────────
 
 def load_entity_lookup(source1_path, source2_path, source3_path):
     print("[score_and_submit.py] loading test source files...")
@@ -36,9 +74,7 @@ def load_entity_lookup(source1_path, source2_path, source3_path):
     return lookup, s1["entity_id"].tolist()
 
 
-# ---------------------------------------------------------------------
-# Score one batch
-# ---------------------------------------------------------------------
+# ─── SCORE ONE BATCH ─────────────────────────────────────────────────────────
 
 def score_batch(source1_ids, candidate_ids, lookup, model, threshold, pred_map):
     if not source1_ids:
@@ -68,18 +104,16 @@ def score_batch(source1_ids, candidate_ids, lookup, model, threshold, pred_map):
     return len(source1_ids), len(matched_indices)
 
 
-# ---------------------------------------------------------------------
-# Process candidate file in chunks
-# ---------------------------------------------------------------------
+# ─── PROCESS CANDIDATE FILE IN CHUNKS ────────────────────────────────────────
 
 def process_test_candidates(candidate_path, lookup, model, threshold, chunk_size=5000):
     print("[score_and_submit.py] processing test candidates in chunks...")
     pred_map = {}
     total_pairs = 0
     total_matches = 0
-    chunk_number = 0
 
     reader = pd.read_csv(candidate_path, sep="\t", dtype=str, chunksize=chunk_size)
+    chunk_number = 0
 
     for chunk in reader:
         chunk = chunk.fillna("")
@@ -118,12 +152,11 @@ def process_test_candidates(candidate_path, lookup, model, threshold, chunk_size
     return pred_map
 
 
-# ---------------------------------------------------------------------
-# Write final submission
-# ---------------------------------------------------------------------
+# ─── WRITE SUBMISSION ────────────────────────────────────────────────────────
 
 def write_matching_results(all_s1_ids, pred_map, output_path):
     print(f"[score_and_submit.py] writing {len(all_s1_ids):,} rows → {output_path}")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         f.write("source1_entity_id\tmatched_entity_ids\n")
         for s1_id in all_s1_ids:
@@ -132,12 +165,9 @@ def write_matching_results(all_s1_ids, pred_map, output_path):
     print("[score_and_submit.py] done writing submission")
 
 
-# ---------------------------------------------------------------------
-# Threshold tuning
-# ---------------------------------------------------------------------
+# ─── THRESHOLD TUNING ────────────────────────────────────────────────────────
 
 def tune_threshold_f05(model, val_features_path):
-    from sklearn.metrics import fbeta_score
     print(f"[score_and_submit.py] tuning threshold from {val_features_path} ...")
     val = pd.read_csv(val_features_path, sep="\t")
     missing = [c for c in FEATURE_COLS if c not in val.columns]
@@ -160,9 +190,7 @@ def tune_threshold_f05(model, val_features_path):
     return best_thresh
 
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
@@ -197,12 +225,15 @@ def main():
 
     write_matching_results(all_s1_ids, pred_map, args.out)
 
-    print()
-    print("=" * 40)
+    print("=" * 50)
     print("SUBMISSION CREATED")
     print("=" * 40)
     print(f"File:      {args.out}")
     print(f"Threshold: {threshold:.2f}")
+    n_with_matches = sum(1 for s1 in all_s1_ids if pred_map.get(s1))
+    n_singletons   = len(all_s1_ids) - n_with_matches
+    print(f"S1 entities with >=1 match : {n_with_matches:,}")
+    print(f"S1 entities as singleton   : {n_singletons:,}")
 
 
 if __name__ == "__main__":

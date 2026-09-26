@@ -5,12 +5,20 @@ Blocking strategy (multi-pass, high recall):
   NP  country + sorted-pair of two name content tokens
   NT  country + single long name token (>= 7 chars)
   ND  country + first 12 chars of normalized name
+  NS  country + first 3 chars of normalized name  (typo-tolerant, short names)
+  DM  country + domain-derived name tokens         (e.g. "mimbrothers.com" → "mim brothers")
   Z   country + postal code
   AP  country + sorted-pair of two address content tokens
 """
 
 import re
 import unicodedata
+
+try:
+    from unidecode import unidecode as _unidecode
+    _HAS_UNIDECODE = True
+except ImportError:
+    _HAS_UNIDECODE = False
 
 # -----------------------------------------------------------------------
 # Stop words
@@ -40,14 +48,22 @@ ADDR_STOP = frozenset([
 _DOMAIN_TLD_RE = re.compile(
     r"\.(com|org|net|in|co|io|biz|info)\b", re.IGNORECASE
 )
+# Matches a standalone domain-like token: word chars + a known TLD suffix
+_DOMAIN_TOKEN_RE = re.compile(
+    r"\b([\w\-]+)\.(com|org|net|in|co|io|biz|info)\b", re.IGNORECASE
+)
+# CamelCase / run-together word splitter (e.g. "mimbrothers" → "mim brothers")
+_CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _NON_WORD_RE   = re.compile(r"[^\w\s]")
 _SPACE_RE      = re.compile(r"\s+")
 
 
 def ascii_normalize(text: str) -> str:
     """
-    Lowercase, transliterate non-ASCII to closest ASCII equivalent,
-    strip domain TLDs, remove punctuation, collapse whitespace.
+    Lowercase, transliterate non-ASCII to closest ASCII equivalent
+    (uses unidecode when available for better Hindi/Telugu/Gujarati support,
+    falls back to NFKD otherwise), strip domain TLDs, remove punctuation,
+    collapse whitespace.
     """
     if not isinstance(text, str):
         return ""
@@ -55,8 +71,11 @@ def ascii_normalize(text: str) -> str:
     if len(text) > 500:
         text = text[:500]
     try:
-        s = unicodedata.normalize("NFKD", text)
-        s = s.encode("ascii", "ignore").decode("ascii")
+        if _HAS_UNIDECODE:
+            s = _unidecode(text)
+        else:
+            s = unicodedata.normalize("NFKD", text)
+            s = s.encode("ascii", "ignore").decode("ascii")
     except Exception:
         s = text[:500]
     s = s.lower().strip()
@@ -64,6 +83,25 @@ def ascii_normalize(text: str) -> str:
     s = _NON_WORD_RE.sub(" ", s)
     s = _SPACE_RE.sub(" ", s).strip()
     return s
+
+
+def _extract_domain_name(text: str) -> str:
+    """
+    If *text* contains a domain-like token (e.g. "mimbrothers.com"),
+    return the stem split on CamelCase/run-together boundaries, lowercased.
+    Returns "" if no domain token found.
+    Example: "mimbrothers.com"  → "mim brothers"
+             "MyCompany.in"     → "my company"
+    """
+    if not isinstance(text, str):
+        return ""
+    m = _DOMAIN_TOKEN_RE.search(text)
+    if not m:
+        return ""
+    stem = m.group(1)
+    # Split CamelCase or run-together words (best-effort)
+    split = _CAMEL_RE.sub(" ", stem)
+    return split.lower().strip()
 
 
 def name_content_tokens(name: str, min_len: int = 3):
@@ -82,6 +120,15 @@ def build_block_keys(country: str, name: str, address: str) -> set:
     """
     Return a set of integer-hashed blocking keys for one record.
     Using hash(tuple) collapses each key to one Python int — ~8 bytes vs ~200.
+
+    Key types:
+      NP  country + sorted-pair of first-5 name content tokens (6-char prefix each)
+      NT  country + individual long name token (>=7 chars, 9-char prefix)
+      ND  country + first 12 chars of normalized name
+      NS  country + first 3 chars of normalized name  (typo-tolerant; helps short names)
+      DM  country + domain-stem tokens from name or address
+      Z   country + postal code
+      AP  country + sorted-pair of first-4 address content tokens
     """
     keys: set = set()
     c = str(country).strip()
@@ -101,9 +148,27 @@ def build_block_keys(country: str, name: str, address: str) -> set:
         if len(t) >= 7:
             keys.add(hash(("NT", c, t[:9])))
 
-    # ND: normalized name prefix
+    # ND: normalized name prefix (12 chars)
     if norm_name:
         keys.add(hash(("ND", c, norm_name[:12])))
+
+    # NS: short 3-char prefix — typo-tolerant, catches short or badly OCR'd names
+    if norm_name and len(norm_name) >= 3:
+        keys.add(hash(("NS", c, norm_name[:3])))
+
+    # DM: domain-name-derived tokens from name and address fields
+    # e.g. "mimbrothers.com" → tokens ["mim", "brothers"]
+    for field in (name, address):
+        dom = _extract_domain_name(field)
+        if dom:
+            dom_toks = [t for t in dom.split() if len(t) >= 3]
+            # Index each domain token individually (short stems are already specific)
+            for t in dom_toks[:3]:
+                keys.add(hash(("DM", c, t[:9])))
+            # Also index the full joined stem for exact domain matches
+            joined = "".join(dom_toks)[:12]
+            if joined:
+                keys.add(hash(("DM", c, joined)))
 
     # Z: postal code
     m = re.search(r"\b(\d{4,6})\b", str(address))

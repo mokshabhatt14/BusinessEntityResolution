@@ -10,6 +10,7 @@ Usage:
         --model-out output/matcher_model.joblib \\
         --val-out output/val_features.tsv
 """
+
 import argparse
 
 import joblib
@@ -35,7 +36,9 @@ def split_by_entity(df, test_size=0.2, random_state=42):
 
 
 def prepare_xy(df):
-    X = df[FEATURE_COLS].astype(float)
+    # Only use the feature columns that actually exist in the data
+    cols = [c for c in FEATURE_COLS if c in df.columns]
+    X = df[cols].astype(float).fillna(0.0)
     y = df["label"].astype(int)
     return X, y
 
