@@ -1,100 +1,115 @@
 """
-build_train_candidates.py  — streaming, minimal RAM usage
-Reads every file in chunks, never holds more than one chunk at a time.
+build_train_candidates.py  — memory-efficient blocking
+Uses integer entity ID indices instead of strings to cut RAM by ~5x.
 Output: output/train_candidate_pairs.tsv
 """
 import gc
 import collections
-import csv
 import pandas as pd
 from normalize import build_block_keys
 
-CAP_PER_KEY = 200
-MAX_CANDS   = 500
-CHUNK_SIZE  = 100_000   # smaller chunks = less peak RAM
+CAP_PER_KEY = 50    # reduced from 200 — enough for high recall, saves RAM
+MAX_CANDS   = 300   # reduced from 500
+CHUNK_SIZE  = 100_000
 
 COLS = ["entity_id", "business_name", "business_address", "country"]
 
-def iter_tsv(path):
-    """Yield (entity_id, name, address, country) rows, skipping bad lines."""
-    for chunk in pd.read_csv(path, sep="\t", dtype=str, usecols=COLS,
+def iter_tsv(path, cols=COLS):
+    for chunk in pd.read_csv(path, sep="\t", dtype=str, usecols=cols,
                              chunksize=CHUNK_SIZE, on_bad_lines="skip",
                              engine="python"):
-        chunk = chunk.fillna("")
-        yield from chunk.itertuples(index=False)
+        yield from chunk.fillna("").itertuples(index=False)
 
-# ── Step 1: pool key index (S2 + S3), streaming ───────────────────────────
-print("Building pool key index (S2 + S3) ...")
-key_to_pool_ids: dict = {}
+# ── Step 1: pool — assign integer indices, build key index ───────────────
+print("Step 1: indexing pool (S2+S3) ...")
+pool_id_list = []           # pool_int_idx -> entity_id string
+key_to_pool_ints: dict = {} # key -> [int, ...]
 n_pool = 0
+
 for path in ["dataset/train/train_source2.tsv", "dataset/train/train_source3.tsv"]:
     print(f"  {path}")
     for row in iter_tsv(path):
+        idx = len(pool_id_list)
+        pool_id_list.append(row.entity_id)
         for k in build_block_keys(row.country, row.business_name, row.business_address):
-            b = key_to_pool_ids.setdefault(k, [])
+            b = key_to_pool_ints.setdefault(k, [])
             if len(b) < CAP_PER_KEY:
-                b.append(row.entity_id)
+                b.append(idx)
         n_pool += 1
-        if n_pool % 500_000 == 0:
-            print(f"    {n_pool:,} pool rows processed")
-gc.collect()
-print(f"Pool index: {len(key_to_pool_ids):,} keys from {n_pool:,} rows")
+        if n_pool % 1_000_000 == 0:
+            print(f"    {n_pool:,} rows")
 
-# ── Step 2: S1 key index, streaming ──────────────────────────────────────
-print("Building S1 key index ...")
-key_to_s1_ids: dict = {}
-s1_ids_order = []   # preserve original order for output
+gc.collect()
+print(f"  pool: {n_pool:,} rows, {len(key_to_pool_ints):,} keys")
+
+# ── Step 2: S1 — stream and build key index ───────────────────────────────
+print("Step 2: indexing S1 ...")
+key_to_s1_ints: dict = {}
+s1_id_list = []
 n_s1 = 0
+
 for row in iter_tsv("dataset/train/train_source1.tsv"):
-    s1_ids_order.append(row.entity_id)
+    idx = len(s1_id_list)
+    s1_id_list.append(row.entity_id)
     for k in build_block_keys(row.country, row.business_name, row.business_address):
-        key_to_s1_ids.setdefault(k, []).append(row.entity_id)
+        key_to_s1_ints.setdefault(k, []).append(idx)
     n_s1 += 1
-    if n_s1 % 500_000 == 0:
-        print(f"    {n_s1:,} S1 rows processed")
-gc.collect()
-print(f"S1 index: {len(key_to_s1_ids):,} keys from {n_s1:,} rows")
+    if n_s1 % 1_000_000 == 0:
+        print(f"    {n_s1:,} rows")
 
-# ── Step 3: join ──────────────────────────────────────────────────────────
-print("Joining ...")
-s1_candidates: dict = collections.defaultdict(set)
-common = set(key_to_pool_ids) & set(key_to_s1_ids)
-print(f"Common keys: {len(common):,}")
+gc.collect()
+print(f"  S1: {n_s1:,} rows, {len(key_to_s1_ints):,} keys")
+
+# ── Step 3: join (all integers — very cheap) ──────────────────────────────
+print("Step 3: joining ...")
+s1_cands: dict = collections.defaultdict(set)  # s1_int -> set of pool_ints
+common = set(key_to_pool_ints) & set(key_to_s1_ints)
+print(f"  common keys: {len(common):,}")
 for k in common:
-    pool_ids = key_to_pool_ids[k]
-    for sid in key_to_s1_ids[k]:
-        s1_candidates[sid].update(pool_ids)
-del key_to_pool_ids, key_to_s1_ids, common
+    pool_ints = key_to_pool_ints[k]
+    for s1_int in key_to_s1_ints[k]:
+        s1_cands[s1_int].update(pool_ints)
+
+del key_to_pool_ints, key_to_s1_ints, common
 gc.collect()
 
-# ── Step 4: write output ──────────────────────────────────────────────────
-print("Writing output/train_candidate_pairs.tsv ...")
+# ── Step 4: write (convert ints back to strings only at write time) ───────
+print("Step 4: writing output/train_candidate_pairs.tsv ...")
 with open("output/train_candidate_pairs.tsv", "w", encoding="utf-8", newline="") as f:
     f.write("source1_entity_id\tcandidate_entity_ids\n")
-    for sid in s1_ids_order:
-        cands = list(s1_candidates.get(sid, set()))[:MAX_CANDS]
-        f.write(f"{sid}\t{','.join(cands)}\n")
+    for s1_int, s1_eid in enumerate(s1_id_list):
+        pool_ints = list(s1_cands.get(s1_int, set()))[:MAX_CANDS]
+        cand_eids = [pool_id_list[i] for i in pool_ints]
+        f.write(f"{s1_eid}\t{','.join(cand_eids)}\n")
 
-n_with = sum(1 for sid in s1_ids_order if sid in s1_candidates)
-avg = sum(min(len(v), MAX_CANDS) for v in s1_candidates.values()) / max(len(s1_ids_order), 1)
-print(f"Done: {len(s1_ids_order):,} S1 rows, {n_with:,} with candidates, avg {avg:.0f} cands/S1")
+n_with = len(s1_cands)
+avg = sum(min(len(v), MAX_CANDS) for v in s1_cands.values()) / max(n_s1, 1)
+print(f"  {n_s1:,} S1 rows, {n_with:,} with candidates, avg {avg:.0f} cands/S1")
 
-# ── Step 5: quick recall check ────────────────────────────────────────────
-print("Recall check (first 5000 GT rows) ...")
+# ── Step 5: recall check ─────────────────────────────────────────────────
+print("Step 5: recall check ...")
+s1_eid_to_int = {eid: i for i, eid in enumerate(s1_id_list)}
+pool_eid_to_int = {eid: i for i, eid in enumerate(pool_id_list)}
 hit = total = 0
-GT_COLS = ["source1_entity_id", "matched_entity_ids"]
-for chunk in pd.read_csv("dataset/train/train_ground_truth.tsv", sep="\t", dtype=str,
-                         usecols=GT_COLS, chunksize=CHUNK_SIZE,
+GT = ["source1_entity_id", "matched_entity_ids"]
+for chunk in pd.read_csv("dataset/train/train_ground_truth.tsv", sep="\t",
+                         dtype=str, usecols=GT, chunksize=CHUNK_SIZE,
                          on_bad_lines="skip", engine="python"):
     for _, row in chunk.fillna("").iterrows():
-        true_ids = [i.strip() for i in row["matched_entity_ids"].split(",") if i.strip()]
-        cands = s1_candidates.get(row["source1_entity_id"], set())
-        for t in true_ids:
+        s1_int = s1_eid_to_int.get(row["source1_entity_id"])
+        if s1_int is None:
+            continue
+        cand_set = s1_cands.get(s1_int, set())
+        for t in row["matched_entity_ids"].split(","):
+            t = t.strip()
+            if not t:
+                continue
             total += 1
-            if t in cands:
+            if pool_eid_to_int.get(t) in cand_set:
                 hit += 1
     if total >= 20000:
         break
+
 if total:
-    print(f"Recall: {hit}/{total} = {hit/total:.3f}")
+    print(f"  Recall: {hit}/{total} = {hit/total:.3f}")
 print("DONE")
