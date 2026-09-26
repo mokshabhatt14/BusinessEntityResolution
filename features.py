@@ -194,14 +194,31 @@ def _load_lookup(source1_path, source2_path, source3_path):
 # EXPLODE CANDIDATE PAIRS
 # ---------------------------------------------------------
 
-def _explode_candidate_pairs(candidate_pairs_path):
-    df = pd.read_csv(candidate_pairs_path, sep="\t", dtype=str).fillna("")
-    df = df[df["candidate_entity_ids"] != ""]
-    df = df.assign(candidate_entity_id=df["candidate_entity_ids"].str.split(","))
-    df = df.explode("candidate_entity_id")
-    df["candidate_entity_id"] = df["candidate_entity_id"].str.strip()
-    df = df[df["candidate_entity_id"] != ""]
-    return df[["source1_entity_id", "candidate_entity_id"]].reset_index(drop=True)
+def _explode_candidate_pairs(candidate_pairs_path, chunksize=50_000):
+    """Stream candidate pairs without loading full file — avoids OOM on explode."""
+    rows = []
+    for chunk in pd.read_csv(candidate_pairs_path, sep="\t", dtype=str,
+                             chunksize=chunksize):
+        chunk = chunk.fillna("")
+        chunk = chunk[chunk["candidate_entity_ids"] != ""]
+        for _, row in chunk.iterrows():
+            s1_id = row["source1_entity_id"]
+            for cid in row["candidate_entity_ids"].split(","):
+                cid = cid.strip()
+                if cid:
+                    rows.append((s1_id, cid))
+        # flush to DataFrame periodically to avoid growing rows list too large
+        if len(rows) >= 5_000_000:
+            yield from rows
+            rows = []
+    yield from rows
+
+def _collect_candidate_pairs(candidate_pairs_path):
+    """Collect all pairs into a DataFrame, chunked to avoid OOM."""
+    all_rows = []
+    for s1_id, cid in _explode_candidate_pairs(candidate_pairs_path):
+        all_rows.append((s1_id, cid))
+    return pd.DataFrame(all_rows, columns=["source1_entity_id", "candidate_entity_id"])
 
 
 # ---------------------------------------------------------
@@ -229,80 +246,82 @@ def build_training_table(
     source1_path,
     source2_path,
     source3_path,
+    out_path="output/train_features.tsv",
     max_pairs=None,
-    batch_size=50_000,
+    batch_size=20_000,
 ):
     print("[features.py] loading source data...")
     lookup = _load_lookup(source1_path, source2_path, source3_path)
 
-    print("[features.py] loading candidate pairs...")
-    pairs = _explode_candidate_pairs(candidate_pairs_path)
-
     print("[features.py] loading ground truth...")
     gt_map = load_ground_truth_map(ground_truth_path)
 
-    print(f"[features.py] {len(pairs):,} candidate pairs found")
+    print("[features.py] streaming candidate pairs + computing features in batches...")
+    return _stream_features(
+        candidate_pairs_path, lookup, gt_map,
+        batch_size=batch_size, max_pairs=max_pairs, out_path=out_path
+    )
 
-    if max_pairs is not None and len(pairs) > max_pairs:
-        print(f"[features.py] sampling {max_pairs:,} from {len(pairs):,}")
-        pairs = pairs.sample(n=max_pairs, random_state=42).reset_index(drop=True)
 
-    # Filter to known entity IDs
-    before = len(pairs)
-    pairs = pairs[
-        pairs["source1_entity_id"].isin(lookup.index) &
-        pairs["candidate_entity_id"].isin(lookup.index)
-    ].reset_index(drop=True)
-    if before - len(pairs):
-        print(f"[features.py] dropped {before-len(pairs):,} pairs with unknown IDs")
+def _stream_features(candidate_pairs_path, lookup, gt_map,
+                     batch_size=20_000, max_pairs=None, out_path="output/train_features.tsv"):
+    """
+    Streams candidate pairs in batches, writes features directly to disk.
+    Never holds more than batch_size pairs in RAM at once.
+    Returns the output path.
+    """
+    total_pairs = 0
+    total_pos   = 0
+    buf_s1, buf_cand = [], []
+    cols = ["source1_entity_id", "candidate_entity_id"] + FEATURE_COLS + ["label"]
+    first_write = True
 
-    print(f"[features.py] computing features for {len(pairs):,} pairs in batches...")
+    def flush(buf_s1, buf_cand):
+        nonlocal total_pos, first_write
+        chunk_df = _compute_chunk(buf_s1, buf_cand, lookup, gt_map)
+        total_pos += int(chunk_df["label"].sum())
+        chunk_df[cols].to_csv(
+            out_path, sep="\t", index=False,
+            mode="w" if first_write else "a",
+            header=first_write
+        )
+        first_write = False
 
-    # Build arrays
-    s1_ids   = pairs["source1_entity_id"].to_numpy()
-    cand_ids = pairs["candidate_entity_id"].to_numpy()
+    for s1_id, cid in _explode_candidate_pairs(candidate_pairs_path):
+        if max_pairs and total_pairs >= max_pairs:
+            break
+        if s1_id not in lookup.index or cid not in lookup.index:
+            continue
+        buf_s1.append(s1_id)
+        buf_cand.append(cid)
+        total_pairs += 1
+        if len(buf_s1) >= batch_size:
+            flush(buf_s1, buf_cand)
+            if total_pairs % 500_000 == 0:
+                print(f"  [{total_pairs:,} pairs, {total_pos:,} pos]")
+            buf_s1, buf_cand = [], []
 
+    if buf_s1:
+        flush(buf_s1, buf_cand)
+
+    print(f"  [{total_pairs:,} pairs total, {total_pos:,} positive]")
+    return out_path
+
+
+def _compute_chunk(s1_ids, cand_ids, lookup, gt_map):
     s1_info   = lookup.reindex(s1_ids)[["business_name","business_address","country"]].fillna("").reset_index(drop=True)
     cand_info = lookup.reindex(cand_ids)[["business_name","business_address","country"]].fillna("").reset_index(drop=True)
-
-    names1    = s1_info["business_name"].to_numpy(dtype=object)
-    names2    = cand_info["business_name"].to_numpy(dtype=object)
-    addrs1    = s1_info["business_address"].to_numpy(dtype=object)
-    addrs2    = cand_info["business_address"].to_numpy(dtype=object)
-    countries1 = s1_info["country"].to_numpy(dtype=object)
-    countries2 = cand_info["country"].to_numpy(dtype=object)
-
-    n = len(pairs)
-    feat_arrays = {col: np.empty(n, dtype=np.float32) for col in FEATURE_COLS}
-
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        if start % 500_000 == 0:
-            print(f"  [{start:,} / {n:,}]")
-        batch = compute_features_batch(
-            names1[start:end], names2[start:end],
-            addrs1[start:end], addrs2[start:end],
-            countries1[start:end], countries2[start:end],
-        )
-        for col in FEATURE_COLS:
-            feat_arrays[col][start:end] = batch[col]
-
-    # Build result DataFrame
-    result = pd.DataFrame({
-        "source1_entity_id":  s1_ids,
-        "candidate_entity_id": cand_ids,
-        **feat_arrays,
-    })
-
-    # Label
-    print("[features.py] labeling pairs...")
-    result["label"] = [
-        int(cand in gt_map.get(src, set()))
-        for src, cand in zip(result["source1_entity_id"], result["candidate_entity_id"])
-    ]
-
-    cols = ["source1_entity_id", "candidate_entity_id"] + FEATURE_COLS + ["label"]
-    return result[cols]
+    feats = compute_features_batch(
+        s1_info["business_name"].to_numpy(dtype=object),
+        cand_info["business_name"].to_numpy(dtype=object),
+        s1_info["business_address"].to_numpy(dtype=object),
+        cand_info["business_address"].to_numpy(dtype=object),
+        s1_info["country"].to_numpy(dtype=object),
+        cand_info["country"].to_numpy(dtype=object),
+    )
+    df = pd.DataFrame({"source1_entity_id": s1_ids, "candidate_entity_id": cand_ids, **feats})
+    df["label"] = [int(c in gt_map.get(s, set())) for s, c in zip(s1_ids, cand_ids)]
+    return df
 
 
 # ---------------------------------------------------------
@@ -320,16 +339,17 @@ def main():
     parser.add_argument("--max-pairs",     type=int, default=None)
     args = parser.parse_args()
 
-    table = build_training_table(
+    build_training_table(
         args.candidate, args.ground_truth,
         args.source1, args.source2, args.source3,
+        out_path=args.out,
         max_pairs=args.max_pairs,
     )
 
-    table.to_csv(args.out, sep="\t", index=False)
-
-    n_pos   = int(table["label"].sum())
-    n_total = len(table)
+    # Read back just label column for summary stats (lightweight)
+    labels = pd.read_csv(args.out, sep="\t", usecols=["label"])["label"]
+    n_pos   = int(labels.sum())
+    n_total = len(labels)
     print(f"\n{'='*40}")
     print(f"[features.py] wrote {n_total:,} labeled pairs")
     print(f"  positive: {n_pos:,}  ({n_pos/n_total*100:.2f}%)")
