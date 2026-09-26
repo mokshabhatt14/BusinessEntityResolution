@@ -33,13 +33,14 @@ import re
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 from normalize import ascii_normalize, name_content_tokens, addr_content_tokens
 
 # ---------------------------------------------------------
 # POSTAL CODE PATTERN
 # ---------------------------------------------------------
+
 _POSTAL_RE = re.compile(r"\b(\d{4,6})\b")
 
 
@@ -48,6 +49,48 @@ def _extract_postal_code(address):
         return None
     matches = _POSTAL_RE.findall(address)
     return matches[-1] if matches else None
+
+
+# ---------------------------------------------------------
+# HELPER EXTRACTORS (available for import by other modules)
+# ---------------------------------------------------------
+
+_PHONE_RE = re.compile(r"(?<!\d)(\+?\d[\d\s\-().]{7,}\d)(?!\d)")
+
+
+def extract_phone(text: str) -> str:
+    """Return the last >=10-digit phone number found in *text*, digits only."""
+    if not isinstance(text, str):
+        return ""
+    for m in reversed(_PHONE_RE.findall(text)):
+        digits = re.sub(r"\D", "", m)
+        if len(digits) >= 10:
+            return digits[-10:]
+    return ""
+
+
+_STREET_NUM_RE = re.compile(r"^\s*(\d+)")
+
+
+def extract_street_number(address: str) -> str:
+    """Return the leading street number from an address, or ''."""
+    if not isinstance(address, str):
+        return ""
+    m = _STREET_NUM_RE.match(address)
+    return m.group(1) if m else ""
+
+
+def _is_acronym_of(short: str, long_name: str) -> bool:
+    """Return True if *short* is the acronym formed from first letters of *long_name*'s tokens."""
+    s_tokens = short.split()
+    l_tokens = long_name.split()
+    if len(s_tokens) != 1 or len(l_tokens) < 2:
+        return False
+    acronym = short.strip()
+    if len(acronym) < 2:
+        return False
+    initials = "".join(t[0] for t in l_tokens if t)
+    return acronym == initials
 
 
 # ---------------------------------------------------------
