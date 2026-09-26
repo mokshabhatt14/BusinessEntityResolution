@@ -11,11 +11,17 @@ CAP_PER_KEY = 200
 MAX_CANDS   = 500
 CHUNK_SIZE  = 200_000   # rows per chunk — keeps RAM under ~2 GB
 
-print("Loading train S1...")
-s1 = pd.read_csv(
+print("Loading train S1 in chunks...")
+s1_chunks = []
+for chunk in pd.read_csv(
     "dataset/train/train_source1.tsv", sep="\t", dtype=str,
-    usecols=["entity_id", "business_name", "business_address", "country"]
-).fillna("")
+    usecols=["entity_id", "business_name", "business_address", "country"],
+    chunksize=CHUNK_SIZE, on_bad_lines="skip"
+):
+    s1_chunks.append(chunk.fillna(""))
+s1 = pd.concat(s1_chunks, ignore_index=True)
+del s1_chunks
+gc.collect()
 print(f"S1: {len(s1):,} rows")
 
 # ── Step 1: build pool key index in chunks ────────────────────────────────
@@ -26,7 +32,7 @@ for src_path in ["dataset/train/train_source2.tsv", "dataset/train/train_source3
     print(f"  reading {src_path}...")
     for chunk in pd.read_csv(src_path, sep="\t", dtype=str,
                               usecols=["entity_id", "business_name", "business_address", "country"],
-                              chunksize=CHUNK_SIZE):
+                              chunksize=CHUNK_SIZE, on_bad_lines="skip"):
         chunk = chunk.fillna("")
         for row in chunk.itertuples(index=False):
             for k in build_block_keys(row.country, row.business_name, row.business_address):
