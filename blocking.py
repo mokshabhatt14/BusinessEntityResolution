@@ -1,16 +1,15 @@
 import pandas as pd
 import gc
-from normalize import normalize_name, normalize_address
+from normalize import make_block_keys_series
 
 def load_and_normalize(path, nrows=None):
     df = pd.read_csv(path, sep="\t", nrows=nrows, usecols=["entity_id", "business_name", "business_address", "country"])
     df["entity_id"] = df["entity_id"].str.strip()
-    df["norm_name"] = df["business_name"].apply(normalize_name)
-    df["block_key"] = df["country"].astype(str) + "_" + df["norm_name"].str[:4]
+    df["block_key"] = make_block_keys_series(df["country"], df["business_name"])
     return df[["entity_id", "block_key"]]  # drop unneeded columns to save memory
 
-print("Loading S1...")
-s1 = load_and_normalize("dataset/train/train_source1.tsv", nrows=500)
+print("Loading S1 (full)...")
+s1 = load_and_normalize("dataset/train/train_source1.tsv")
 print("Loaded S1:", len(s1))
 
 print("Loading S2 (full file)...")

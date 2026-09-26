@@ -1,47 +1,83 @@
-import pandas as pd
-from normalize import normalize_name
+"""
+build_submission.py  — fast vectorized multi-key blocking
+Output: output/candidate_pairs.tsv
 
-def load(path, nrows=None):
-    df = pd.read_csv(path, sep="\t", nrows=nrows,
-                      usecols=["entity_id", "business_name", "country"])
-    df["entity_id"] = df["entity_id"].str.strip()
-    df["norm_name"] = df["business_name"].apply(normalize_name)
-    df["block_key"] = df["country"].astype(str) + "_" + df["norm_name"].str[:8]
-    return df
+Same O(total-keys) join strategy as build_train_candidates.py.
+"""
+import gc
+import collections
+import pandas as pd
+from normalize import build_block_keys
+
+CAP_PER_KEY = 200
+MAX_CANDS   = 500
 
 print("Loading test S1...")
-s1 = load("dataset/test/test_source1.tsv")
-print("Loading test S2...")
-s2 = load("dataset/test/test_source2.tsv")
-print("Loading test S3...")
-s3 = load("dataset/test/test_source3.tsv")
+s1 = pd.read_csv(
+    "dataset/test/test_source1.tsv", sep="\t", dtype=str,
+    usecols=["entity_id", "business_name", "business_address", "country"]
+).fillna("")
+print(f"S1: {len(s1):,} rows")
+
+print("Loading test S2 + S3...")
+s2 = pd.read_csv(
+    "dataset/test/test_source2.tsv", sep="\t", dtype=str,
+    usecols=["entity_id", "business_name", "business_address", "country"]
+).fillna("")
+s3 = pd.read_csv(
+    "dataset/test/test_source3.tsv", sep="\t", dtype=str,
+    usecols=["entity_id", "business_name", "business_address", "country"]
+).fillna("")
 pool = pd.concat([s2, s3], ignore_index=True)
 del s2, s3
+gc.collect()
+print(f"Pool: {len(pool):,} rows")
 
-print("Building candidate lookup (capped at 50)...")
-grouped = pool.groupby("block_key")["entity_id"].agg(list)
-key_to_ids = {k: ",".join(v[:50]) for k, v in grouped.items()}
-
-print("Building exact-name-match lookup for matches...")
-name_to_ids = pool.groupby(["block_key", "norm_name"])["entity_id"].agg(list).to_dict()
+# ── Step 1: pool key index ─────────────────────────────────────────────────
+print("Building pool key index...")
+key_to_pool_ids: dict = {}
+for row in pool.itertuples(index=False):
+    eid = row.entity_id
+    for k in build_block_keys(row.country, row.business_name, row.business_address):
+        bucket = key_to_pool_ids.setdefault(k, [])
+        if len(bucket) < CAP_PER_KEY:
+            bucket.append(eid)
 del pool
+gc.collect()
+print(f"Pool index: {len(key_to_pool_ids):,} keys")
 
-s1["candidate_entity_ids"] = s1["block_key"].map(key_to_ids).fillna("")
+# ── Step 2: S1 key index ───────────────────────────────────────────────────
+print("Building S1 key index...")
+key_to_s1_ids: dict = {}
+s1_ids_list = s1["entity_id"].tolist()
+for row in s1.itertuples(index=False):
+    for k in build_block_keys(row.country, row.business_name, row.business_address):
+        key_to_s1_ids.setdefault(k, []).append(row.entity_id)
+print(f"S1 key index: {len(key_to_s1_ids):,} keys")
 
-def exact_matches(row):
-    ids = name_to_ids.get((row["block_key"], row["norm_name"]), [])
-    candidate_set = set(row["candidate_entity_ids"].split(",")) if row["candidate_entity_ids"] else set()
-    valid_ids = [i for i in ids if i in candidate_set]
-    return ",".join(valid_ids[:20])
+# ── Step 3: join ───────────────────────────────────────────────────────────
+print("Joining pool → S1 candidates...")
+s1_candidates: dict = collections.defaultdict(set)
+common_keys = set(key_to_pool_ids) & set(key_to_s1_ids)
+print(f"Common keys: {len(common_keys):,}")
+for k in common_keys:
+    pool_ids = key_to_pool_ids[k]
+    s1_ids   = key_to_s1_ids[k]
+    for sid in s1_ids:
+        s1_candidates[sid].update(pool_ids)
 
-s1["matched_entity_ids"] = s1.apply(exact_matches, axis=1)
+del key_to_pool_ids, key_to_s1_ids
+gc.collect()
 
-print("Writing candidate_pairs.tsv...")
-cand_out = s1[["entity_id", "candidate_entity_ids"]].rename(columns={"entity_id": "source1_entity_id"})
-cand_out.to_csv("output/candidate_pairs.tsv", sep="\t", index=False)
+# ── Step 4: write output ───────────────────────────────────────────────────
+print("Writing output/candidate_pairs.tsv ...")
+with open("output/candidate_pairs.tsv", "w", encoding="utf-8") as f:
+    f.write("source1_entity_id\tcandidate_entity_ids\n")
+    for sid in s1_ids_list:
+        cands = s1_candidates.get(sid, set())
+        cand_list = list(cands)[:MAX_CANDS]
+        f.write(f"{sid}\t{','.join(cand_list)}\n")
 
-print("Writing matching_results.tsv...")
-match_out = s1[["entity_id", "matched_entity_ids"]].rename(columns={"entity_id": "source1_entity_id"})
-match_out.to_csv("output/matching_results.tsv", sep="\t", index=False)
-
+total_cands = sum(min(len(v), MAX_CANDS) for v in s1_candidates.values())
+print(f"Done. {len(s1_ids_list):,} S1 rows, avg {total_cands/len(s1_ids_list):.1f} cands/S1")
 print("DONE")
