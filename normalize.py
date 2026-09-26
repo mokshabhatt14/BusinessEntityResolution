@@ -80,20 +80,12 @@ def addr_content_tokens(addr: str, min_len: int = 4):
 
 def build_block_keys(country: str, name: str, address: str) -> set:
     """
-    Return a set of blocking keys for one record.
-
-    Key types
-    ---------
-    NP : (country, tok_a, tok_b) sorted pair from name content tokens
-    NT : (country, tok)          single long name token (>= 7 chars)
-    ND : (country, prefix)       first 12 chars of ASCII-normalized name
-    Z  : (country, postal)       5-6 digit postal code from address
-    AP : (country, tok_a, tok_b) sorted pair from address content tokens
+    Return a set of integer-hashed blocking keys for one record.
+    Using hash(tuple) collapses each key to one Python int — ~8 bytes vs ~200.
     """
     keys: set = set()
-    country = str(country).strip()
+    c = str(country).strip()
 
-    # --- Name-based keys ---
     ntoks = name_content_tokens(name)
     norm_name = ascii_normalize(name)
 
@@ -101,30 +93,29 @@ def build_block_keys(country: str, name: str, address: str) -> set:
     seen = ntoks[:5]
     for i in range(len(seen)):
         for j in range(i + 1, len(seen)):
-            pair = tuple(sorted([seen[i][:6], seen[j][:6]]))
-            keys.add(("NP", country) + pair)
+            a, b = sorted([seen[i][:6], seen[j][:6]])
+            keys.add(hash(("NP", c, a, b)))
 
-    # NT: individual tokens >= 7 chars (catches e.g. 2-word companies)
+    # NT: individual tokens >= 7 chars
     for t in ntoks[:6]:
         if len(t) >= 7:
-            keys.add(("NT", country, t[:9]))
+            keys.add(hash(("NT", c, t[:9])))
 
     # ND: normalized name prefix
     if norm_name:
-        keys.add(("ND", country, norm_name[:12]))
+        keys.add(hash(("ND", c, norm_name[:12])))
 
-    # --- Address-based keys ---
     # Z: postal code
     m = re.search(r"\b(\d{4,6})\b", str(address))
     if m:
-        keys.add(("Z", country, m.group(1)))
+        keys.add(hash(("Z", c, m.group(1))))
 
     # AP: all pairs from first 4 address content tokens
     atoks = addr_content_tokens(address)[:4]
     for i in range(len(atoks)):
         for j in range(i + 1, len(atoks)):
-            pair = tuple(sorted([atoks[i][:6], atoks[j][:6]]))
-            keys.add(("AP", country) + pair)
+            a, b = sorted([atoks[i][:6], atoks[j][:6]])
+            keys.add(hash(("AP", c, a, b)))
 
     return keys
 
