@@ -13,12 +13,38 @@ MAX_CANDS   = 300
 CHUNK_SIZE  = 100_000
 
 COLS = ["entity_id", "business_name", "business_address", "country"]
+MAX_LINE_BYTES = 10_000
 
 def iter_tsv(path):
-    for chunk in pd.read_csv(path, sep="\t", dtype=str, usecols=COLS,
-                             chunksize=CHUNK_SIZE, on_bad_lines="skip",
-                             engine="python"):
-        yield from chunk.fillna("").itertuples(index=False)
+    """Stream rows as namedtuples using raw binary reads — immune to OOM from corrupt lines."""
+    from collections import namedtuple
+    col_idx = None
+    Row = None
+    with open(path, "rb") as raw:
+        for raw_line in raw:
+            if len(raw_line) > MAX_LINE_BYTES:
+                continue
+            try:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            except Exception:
+                continue
+            parts = line.split("\t")
+            if col_idx is None:
+                col_idx = {c: i for i, c in enumerate(parts)}
+                missing = [c for c in COLS if c not in col_idx]
+                if missing:
+                    raise ValueError(f"Missing columns {missing} in {path}")
+                Row = namedtuple("Row", COLS)
+                continue
+            try:
+                yield Row(
+                    entity_id        = parts[col_idx["entity_id"]].strip(),
+                    business_name    = parts[col_idx["business_name"]]    if col_idx["business_name"]    < len(parts) else "",
+                    business_address = parts[col_idx["business_address"]] if col_idx["business_address"] < len(parts) else "",
+                    country          = parts[col_idx["country"]]          if col_idx["country"]          < len(parts) else "",
+                )
+            except Exception:
+                continue
 
 # ── Step 1: pool key index (S2+S3), integer-based ────────────────────────
 print("Step 1: indexing pool (S2+S3) ...")
