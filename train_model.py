@@ -10,9 +10,7 @@ Usage:
         --model-out output/matcher_model.joblib \\
         --val-out output/val_features.tsv
 """
-
 import argparse
-
 import joblib
 import numpy as np
 import pandas as pd
@@ -24,7 +22,6 @@ from features import FEATURE_COLS
 
 
 def split_by_entity(df, test_size=0.2, random_state=42):
-    """80/20 split grouped by source1_entity_id — no leakage across splits."""
     gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
     groups = df["source1_entity_id"]
     train_idx, val_idx = next(gss.split(df, groups=groups))
@@ -36,7 +33,6 @@ def split_by_entity(df, test_size=0.2, random_state=42):
 
 
 def prepare_xy(df):
-    # Only use the feature columns that actually exist in the data
     cols = [c for c in FEATURE_COLS if c in df.columns]
     X = df[cols].astype(float).fillna(0.0)
     y = df["label"].astype(int)
@@ -47,55 +43,42 @@ def train(df):
     X, y = prepare_xy(df)
     pos = int(y.sum())
     neg = len(y) - pos
-    # Weight positives by imbalance ratio so the model doesn't ignore matches
     sample_weight = np.where(y == 1, neg / max(pos, 1), 1.0)
     model = HistGradientBoostingClassifier(
-        max_iter=500,
-        learning_rate=0.05,
-        max_depth=7,
-        min_samples_leaf=20,
-        l2_regularization=0.1,
-        random_state=42,
+        max_iter=500, learning_rate=0.05, max_depth=7,
+        min_samples_leaf=20, l2_regularization=0.1, random_state=42,
     )
     model.fit(X, y, sample_weight=sample_weight)
     return model
 
 
 def tune_threshold(model, val_df, beta=0.5):
-    """
-    Sweep thresholds 0.01–0.99 and return the one that maximises F-beta
-    on the validation set.  beta=0.5 → F0.5 (precision-weighted).
-    """
     X_val, y_val = prepare_xy(val_df)
     proba = model.predict_proba(X_val)[:, 1]
-    thresholds = np.arange(0.01, 1.00, 0.01)
     best_thresh, best_f = 0.5, -1.0
     rows = []
-    for t in thresholds:
+    for t in np.arange(0.01, 1.00, 0.01):
         preds = (proba >= t).astype(int)
-        f  = fbeta_score(y_val, preds, beta=beta, zero_division=0)
-        p  = precision_score(y_val, preds, zero_division=0)
-        r  = recall_score(y_val, preds, zero_division=0)
+        f = fbeta_score(y_val, preds, beta=beta, zero_division=0)
+        p = precision_score(y_val, preds, zero_division=0)
+        r = recall_score(y_val, preds, zero_division=0)
         rows.append((t, f, p, r))
         if f > best_f:
             best_f, best_thresh = f, t
-
-    # Print top 5 by F0.5 for inspection
     rows.sort(key=lambda x: -x[1])
     print("[train_model.py] Top thresholds by F0.5:")
     for t, f, p, r in rows[:5]:
         print(f"  thresh={t:.2f}  F0.5={f:.4f}  P={p:.4f}  R={r:.4f}")
-
     return float(best_thresh), float(best_f)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--features",      default="output/train_features.tsv")
-    parser.add_argument("--model-out",     default="output/matcher_model.joblib")
-    parser.add_argument("--val-out",       default="output/val_features.tsv")
-    parser.add_argument("--test-size",     type=float, default=0.2)
-    parser.add_argument("--random-state",  type=int,   default=42)
+    parser.add_argument("--features",     default="output/train_features.tsv")
+    parser.add_argument("--model-out",    default="output/matcher_model.joblib")
+    parser.add_argument("--val-out",      default="output/val_features.tsv")
+    parser.add_argument("--test-size",    type=float, default=0.2)
+    parser.add_argument("--random-state", type=int,   default=42)
     args = parser.parse_args()
 
     print(f"[train_model.py] loading {args.features} ...")
@@ -104,23 +87,18 @@ def main():
 
     train_df, val_df = split_by_entity(df, test_size=args.test_size,
                                         random_state=args.random_state)
-    print(f"[train_model.py] train: {len(train_df):,} rows "
-          f"({int(train_df['label'].sum()):,} pos)")
-    print(f"[train_model.py] val:   {len(val_df):,} rows "
-          f"({int(val_df['label'].sum()):,} pos)")
+    print(f"[train_model.py] train: {len(train_df):,} rows ({int(train_df['label'].sum()):,} pos)")
+    print(f"[train_model.py] val:   {len(val_df):,} rows ({int(val_df['label'].sum()):,} pos)")
 
-    print("[train_model.py] training HGBC ...")
+    print("[train_model.py] training ...")
     model = train(train_df)
     joblib.dump(model, args.model_out)
     val_df.to_csv(args.val_out, sep="\t", index=False)
-    print(f"[train_model.py] model saved → {args.model_out}")
-    print(f"[train_model.py] val set saved → {args.val_out}")
+    print(f"[train_model.py] model -> {args.model_out}")
 
     best_thresh, best_f = tune_threshold(model, val_df, beta=0.5)
     print(f"[train_model.py] best val F0.5={best_f:.4f} at threshold={best_thresh:.2f}")
-    print(f"[train_model.py] pass --threshold {best_thresh:.2f} to score_and_submit.py")
 
-    # Save threshold to file for automatic pickup
     with open("output/best_threshold.txt", "w") as fh:
         fh.write(str(best_thresh))
 
