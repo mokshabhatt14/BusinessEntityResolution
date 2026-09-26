@@ -51,11 +51,14 @@ def ascii_normalize(text: str) -> str:
     """
     if not isinstance(text, str):
         return ""
+    # Hard cap — corrupted rows can be megabytes long
+    if len(text) > 500:
+        text = text[:500]
     try:
         s = unicodedata.normalize("NFKD", text)
         s = s.encode("ascii", "ignore").decode("ascii")
     except Exception:
-        s = text
+        s = text[:500]
     s = s.lower().strip()
     s = _DOMAIN_TLD_RE.sub(" ", s)
     s = _NON_WORD_RE.sub(" ", s)
